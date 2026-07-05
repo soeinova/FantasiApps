@@ -1,0 +1,87 @@
+# Build changed Fantasi apps on every push and publish the ELFs as a single
+# "build" artifact (downloads as build.zip).
+#
+# An "app" is any root-level directory containing an app.json. A push only
+# builds the apps whose files changed in that push; changes to shared build
+# infrastructure (Makefile, this workflow) rebuild everything, as does a manual
+# workflow_dispatch run or a push whose base commit is unavailable (new branch,
+# force push).
+
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the pre-push commit is available for diffing.
+          fetch-depth: 0
+
+      # The app SDK (apps/app_api.h, apps/app.ld) lives in the Fantasi tree.
+      - name: Check out Fantasi SDK
+        uses: actions/checkout@v4
+        with:
+          repository: soeinova/Fantasi
+          path: .fantasi
+          sparse-checkout: apps
+
+      - name: Determine apps to build
+        id: apps
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          all_apps() { for j in */app.json; do echo "${j%/app.json}"; done; }
+
+          if [ "$GITHUB_EVENT_NAME" != "push" ]; then
+            echo "manual run: building all apps"
+            apps="$(all_apps)"
+          elif [ -z "${BEFORE:-}" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+               || ! git cat-file -e "$BEFORE" 2>/dev/null; then
+            echo "no diffable base commit (new branch or force push): building all apps"
+            apps="$(all_apps)"
+          else
+            changed="$(git diff --name-only "$BEFORE" "$GITHUB_SHA")"
+            echo "changed files:"; echo "$changed"
+            if echo "$changed" | grep -qE '^(Makefile$|\.github/)'; then
+              echo "build infrastructure changed: building all apps"
+              apps="$(all_apps)"
+            else
+              # Map changed paths to root dirs that are (still) apps.
+              apps="$(echo "$changed" | cut -d/ -f1 | sort -u \
+                      | while read -r d; do [ -f "$d/app.json" ] && echo "$d" || true; done)"
+            fi
+          fi
+
+          echo "apps to build: $(echo $apps)"
+          { echo "list<<EOF"; echo "$apps"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+
+      - name: Install ARM toolchain
+        if: steps.apps.outputs.list != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi
+
+      - name: Build apps
+        if: steps.apps.outputs.list != ''
+        env:
+          APPS: ${{ steps.apps.outputs.list }}
+        run: |
+          set -euo pipefail
+          while read -r app; do
+            [ -n "$app" ] || continue
+            make app APP="$app" FANTASI=.fantasi
+          done <<< "$APPS"
+
+      - name: Upload build.zip
+        if: steps.apps.outputs.list != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: build
+          path: build/*.elf
+          if-no-files-found: error

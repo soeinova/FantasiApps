@@ -1,0 +1,8 @@
+{
+  "id": "hello",
+  "name": "Hello World",
+  "author": "Fantasi",
+  "version": "1.0.0",
+  "category": "Demo",
+  "description": "The reference Fantasi app: prints a greeting, exercises the heap via the app API, reports the ABI version, and returns an exit code. Uploaded to /ramfs and run by the on-device ELF loader.",
+}

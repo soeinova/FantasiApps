@@ -1,0 +1,8 @@
+{
+  "id": "hellogui",
+  "name": "Hello GUI",
+  "author": "Fantasi",
+  "version": "1.0.0",
+  "category": "Demo",
+  "description": "A minimal example app that renders a simple GUI on the Fantasi device display. It is uploaded into the device's /ramfs volume and executed by the on-device ELF loader via the 'launch' command.",
+}
