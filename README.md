@@ -10,6 +10,11 @@ Each app lives in its own root-level directory:
                    (validated: must match ^[A-Za-z0-9_-]+$)
 ```
 
+The top-level `apps.json` is the launcher's app index: each entry points to an
+app by `id`, with its `metadata` field naming the app's JSON file (a bare
+filename, e.g. `hello.json`). It is authored here and synced to
+fantasi.cloud's launcher on deploy - add your app to it to make it show up.
+
 ## Building locally
 
 Requires `arm-none-eabi-gcc` on PATH and a checkout of the Fantasi tree for
