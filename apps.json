@@ -1,0 +1,19 @@
+{
+  "title": "Fantasi Apps",
+  "apps": [
+    {
+      "id": "hello",
+      "name": "Hello World",
+      "author": "Fantasi",
+      "summary": "The reference Fantasi app - greeting, heap test, ABI report.",
+      "metadata": "hello.json"
+    },
+    {
+      "id": "hellogui",
+      "name": "Hello GUI",
+      "author": "Fantasi",
+      "summary": "Draws \"Hello GUI\" on the device display.",
+      "metadata": "hellogui.json"
+    }
+  ]
+}
