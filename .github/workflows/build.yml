@@ -85,3 +85,14 @@ jobs:
           name: build
           path: build/*.elf
           if-no-files-found: error
+
+      # DEPLOY_URL is the apps webhook on fantasi.cloud; the server downloads
+      # the freshly uploaded build artifact and deploys it to the launcher.
+      - name: Trigger deploy on fantasi.cloud
+        if: steps.apps.outputs.list != ''
+        run: |
+          code=$(curl -sS -o /dev/null -w "%{http_code}" -X POST \
+            -H "X-Deploy-Token: ${{ secrets.DEPLOY_TOKEN }}" \
+            "${{ secrets.DEPLOY_URL }}")
+          echo "deploy endpoint returned HTTP $code"
+          test "$code" = "202"
