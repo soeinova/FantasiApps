@@ -1,0 +1,16 @@
+REM BadUSB sample Duckyscript payload - opens Notepad on Windows and types a greeting.
+REM Upload to /badusb and set autorun=hello_world.txt (legacy .txt format).
+DEFAULT_DELAY 50
+DELAY 500
+GUI r
+DELAY 400
+STRING notepad
+ENTER
+DELAY 800
+STRING Hello from Fantasi BadUSB!
+ENTER
+STRING This was typed over an emulated USB keyboard.
+ENTER
+REM Symbols, shift and combos all work:
+STRING 1234567890 !@#$%^&*() _+-={}[]|\:;"'<>,.?/
+ENTER

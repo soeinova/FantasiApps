@@ -1,0 +1,8 @@
+{
+  "id": "badusb",
+  "name": "BadUSB",
+  "author": "Fantasi",
+  "version": "1.0.0",
+  "category": "Tools",
+  "description": "Turns the device into a USB HID keyboard that types out payloads, Rubber Ducky style. Runs Berry (.be) scripts or classic Duckyscript (.txt) loaded from /badusb, with a built-in script picker."
+}

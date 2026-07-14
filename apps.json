@@ -14,6 +14,13 @@
       "author": "Fantasi",
       "summary": "Draws \"Hello GUI\" on the device display.",
       "metadata": "hellogui.json"
+    },
+    {
+      "id": "badusb",
+      "name": "BadUSB",
+      "author": "Fantasi",
+      "summary": "USB HID keyboard that types out Berry/Duckyscript payloads, Rubber Ducky style.",
+      "metadata": "badusb.json"
     }
   ]
 }
