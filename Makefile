@@ -18,6 +18,9 @@
 
 FANTASI ?= ../Fantasi
 SDK     := $(FANTASI)/apps
+# Apps that embed Berry (e.g. badusb, which defines native Berry modules) include
+# berry.h; the Berry headers live in the Fantasi tree under third_party/berry.
+BERRY   := $(FANTASI)/third_party/berry
 BUILD   := build
 APP     ?=
 
@@ -34,7 +37,8 @@ VALID_APP := $(filter $(APP),$(ALL_APPS))
 # address references (data and calls) through relocated literals, so the loader
 # only ever sees R_ARM_ABS32 (plus R_ARM_V4BX on ARMv4T, which it ignores).
 COMMON := -Os -ffreestanding -fno-common -mword-relocations -mlong-calls \
-          -ffunction-sections -fdata-sections -nostdlib -Wall -I$(SDK)
+          -ffunction-sections -fdata-sections -nostdlib -Wall -I$(SDK) \
+          -I$(BERRY) -I$(BERRY)/src
 
 # Per-core flags. Cortex-M is Thumb-2 + hard FP; ARM7TDMI is ARM-mode + interwork.
 CM4_FLAGS  := -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16

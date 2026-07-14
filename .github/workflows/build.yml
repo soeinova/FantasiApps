@@ -22,13 +22,16 @@ jobs:
           # Full history so the pre-push commit is available for diffing.
           fetch-depth: 0
 
-      # The app SDK (apps/app_api.h, apps/app.ld) lives in the Fantasi tree.
+      # The app SDK (apps/app_api.h, apps/app.ld) lives in the Fantasi tree, as do
+      # the Berry headers (third_party/berry) that Berry-embedding apps include.
       - name: Check out Fantasi SDK
         uses: actions/checkout@v4
         with:
           repository: soeinova/Fantasi
           path: .fantasi
-          sparse-checkout: apps
+          sparse-checkout: |
+            apps
+            third_party/berry
 
       - name: Determine apps to build
         id: apps
