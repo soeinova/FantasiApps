@@ -158,6 +158,28 @@ static void combo_tap(uint8_t mod, uint8_t key)
     g_api->hid_send(0, 0, 0);   /* release */
 }
 
+/* Type a Windows Alt+numpad code (CP437 / OEM). Left Alt is held down the whole
+ * time - unlike combo_tap, which releases after each key - while the decimal
+ * digits are tapped on the keypad; the glyph appears when Alt is released. Lets
+ * scripts emit box/block/extended-ASCII glyphs that ascii_to_key() can't. */
+static void alt_code(unsigned n)
+{
+    static const uint8_t kp[10] = {   /* keypad 0-9 HID usage ids */
+        0x62, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F, 0x60, 0x61
+    };
+    uint8_t digit[10];
+    int len = 0;
+    do { digit[len++] = (uint8_t)(n % 10); n /= 10; } while (n && len < 10);
+
+    g_api->hid_send(FANTASI_HID_LALT, 0, 0);           /* Alt down */
+    while (len--) {                                    /* most-significant first */
+        uint8_t k[1] = { kp[digit[len]] };
+        g_api->hid_send(FANTASI_HID_LALT, k, 1);       /* Alt + digit */
+        g_api->hid_send(FANTASI_HID_LALT, 0, 0);       /* digit up, Alt still held */
+    }
+    g_api->hid_send(0, 0, 0);                          /* Alt up -> glyph appears */
+}
+
 static void type_string(const char *s)
 {
     for (; s && *s; s++) {
@@ -221,6 +243,10 @@ static int l_combo(bvm *vm)
     be_return_nil(vm);
 }
 
+/* hid.altcode(219) - type an extended glyph by its Windows Alt+numpad (CP437)
+ * code, e.g. 219 = full block, 220 = lower half, 223 = upper half. */
+static int l_altcode(bvm *vm) { alt_code((unsigned)be_toint(vm, 1)); be_return_nil(vm); }
+
 static void add_fn(bvm *vm, const char *name, bntvfunc fn)
 {
     be_pushntvfunction(vm, fn);
@@ -237,6 +263,7 @@ static void register_hid(bvm *vm)
     add_fn(vm, "string", l_string);
     add_fn(vm, "key",    l_key);
     add_fn(vm, "combo",  l_combo);
+    add_fn(vm, "altcode", l_altcode);
     add_fn(vm, "host",   l_host);
     be_setglobal(vm, "hid");
     be_pop(vm, 1);
