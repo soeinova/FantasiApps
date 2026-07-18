@@ -67,8 +67,13 @@ jobs:
       - name: Install ARM toolchain
         if: steps.apps.outputs.list != ''
         run: |
+          # libnewlib-dev supplies the bare-metal libc HEADERS (<assert.h>,
+          # <string.h>, ...) that Berry-embedding apps pull in via berry.h. It's a
+          # Recommends of gcc-arm-none-eabi, so --no-install-recommends drops it and
+          # the build fails "assert.h: No such file". Apps are -nostdlib + `ld -r`
+          # (no libc LINKED), so we only need the headers, not the .a libs.
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi
+          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi libnewlib-dev
 
       - name: Build apps
         if: steps.apps.outputs.list != ''
@@ -91,8 +96,9 @@ jobs:
 
       # DEPLOY_URL is the apps webhook on fantasi.cloud; the server downloads
       # the freshly uploaded build artifact and deploys it to the launcher.
+      # Deploy only from dev.
       - name: Trigger deploy on fantasi.cloud
-        if: steps.apps.outputs.list != ''
+        if: steps.apps.outputs.list != '' && github.ref == 'refs/heads/dev'
         run: |
           code=$(curl -sS -o /dev/null -w "%{http_code}" -X POST \
             -H "X-Deploy-Token: ${{ secrets.DEPLOY_TOKEN }}" \
