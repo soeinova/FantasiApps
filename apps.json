@@ -21,6 +21,13 @@
       "author": "Fantasi",
       "summary": "USB HID keyboard that types out Berry/Duckyscript payloads, Rubber Ducky style.",
       "metadata": "badusb.json"
+    },
+    {
+      "id": "rfid",
+      "name": "RFID",
+      "author": "Fantasi",
+      "summary": "Read, write, sniff, crack, and emulate RFID tags.",
+      "metadata": "rfid.json"
     }
   ]
 }

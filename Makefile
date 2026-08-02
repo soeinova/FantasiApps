@@ -1,6 +1,9 @@
 # Build a Fantasi app from this repo into loadable ELF(s):  make app APP=hello
 #
 # Apps live at the repo root as <app>/<app>.c with metadata in <app>/app.json.
+# A multi-file app may also carry feature modules under <app>/modules/*.c: the
+# main <app>.c is built to <id>.elf and each module to its own <basename>.elf,
+# which the on-device driver hot-loads by that basename (e.g. rfid + hf/lf/...).
 # Apps are freestanding, relocatable ARM objects (one ET_REL object, relocations
 # collapsed to R_ARM_ABS32 + the harmless R_ARM_V4BX marker). The binary is
 # architecture-specific, so this builds one ELF per supported core, named after
@@ -36,13 +39,20 @@ VALID_APP := $(filter $(APP),$(ALL_APPS))
 # Flags shared by every variant. -mword-relocations + -mlong-calls force all
 # address references (data and calls) through relocated literals, so the loader
 # only ever sees R_ARM_ABS32 (plus R_ARM_V4BX on ARMv4T, which it ignores).
-COMMON := -Os -ffreestanding -fno-common -mword-relocations -mlong-calls \
+# Optimisation level is per-core (below), NOT here: cm4 (Flipper/Chameleon, ample RAM) builds -O2 for speed -
+# it materially lowers the tag-emulation FDT by fully inlining the per-symbol reply producer - while arm7
+# (Proxmark3, tight ramfs heap) stays -Os for size.
+COMMON := -ffreestanding -fno-common -mword-relocations -mlong-calls \
           -ffunction-sections -fdata-sections -nostdlib -Wall -I$(SDK) \
+          -I$(APP) -I$(APP)/modules \
           -I$(BERRY) -I$(BERRY)/src
 
 # Per-core flags. Cortex-M is Thumb-2 + hard FP; ARM7TDMI is ARM-mode + interwork.
-CM4_FLAGS  := -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16
-ARM7_FLAGS := -mcpu=arm7tdmi -mthumb-interwork
+# -DEMU_STREAM_BUF (cm4 only): compiles the mfc_emu crypto-reply BUFFER fallback needed by CPU-bit-banged
+# frontends (Flipper) that can't overlap the producer with TX. Harmless to apps that don't use it; the ARM7
+# build (Proxmark3, RAM-tight) omits it so its module carries only the streaming path.
+CM4_FLAGS  := -O2 -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 -DEMU_STREAM_BUF
+ARM7_FLAGS := -Os -mcpu=arm7tdmi -mthumb-interwork
 
 .PHONY: all app clean
 all:
@@ -68,16 +78,22 @@ app:
 	  *[!A-Za-z0-9_-]*) echo "error: app id '$$name' in $(APP)/app.json is invalid: it must contain only [A-Za-z0-9_-]" >&2; exit 1;; \
 	esac; \
 	mkdir -p $(BUILD) && \
-	$(MAKE) --no-print-directory _variant APP=$(APP) NAME="$$name" VARIANT=cm4  VFLAGS="$(CM4_FLAGS)" && \
-	$(MAKE) --no-print-directory _variant APP=$(APP) NAME="$$name" VARIANT=arm7 VFLAGS="$(ARM7_FLAGS)" && \
-	echo "built $(BUILD)/$$name.cm4.elf (FZ/CU) and $(BUILD)/$$name.arm7.elf (PM3)"
+	$(MAKE) --no-print-directory _variant APP=$(APP) SRC="$(APP)/$(APP).c" BASE="$$name" VARIANT=cm4  VFLAGS="$(CM4_FLAGS)"  && \
+	$(MAKE) --no-print-directory _variant APP=$(APP) SRC="$(APP)/$(APP).c" BASE="$$name" VARIANT=arm7 VFLAGS="$(ARM7_FLAGS)" && \
+	for m in $(APP)/modules/*.c; do [ -e "$$m" ] || continue; b="$$(basename "$$m" .c)"; \
+	  $(MAKE) --no-print-directory _variant APP=$(APP) SRC="$$m" BASE="$$b" VARIANT=cm4  VFLAGS="$(CM4_FLAGS)"  || exit 1; \
+	  $(MAKE) --no-print-directory _variant APP=$(APP) SRC="$$m" BASE="$$b" VARIANT=arm7 VFLAGS="$(ARM7_FLAGS)" || exit 1; \
+	done && \
+	echo "built $(BUILD)/$$name.{cm4,arm7}.elf$$( [ -d $(APP)/modules ] && echo ' + modules/ (by basename)' )"
 
-# Internal: build one architecture variant.
+# Internal: build one source file into one architecture variant. The app's main is built as $(APP)/$(APP).c
+# named by the app.json "id" (BASE); feature modules under $(APP)/modules/ are each built by their .c basename
+# (the on-device driver hot-loads them by that name), so one app can span the driver + several module ELFs.
 .PHONY: _variant
 _variant:
-	$(CC) $(VFLAGS) $(COMMON) -c $(APP)/$(APP).c -o $(BUILD)/$(NAME).$(VARIANT).o
-	$(LD) -r -T $(SDK)/app.ld $(BUILD)/$(NAME).$(VARIANT).o -o $(BUILD)/$(NAME).$(VARIANT).elf
-	@rm -f $(BUILD)/$(NAME).$(VARIANT).o
+	$(CC) $(VFLAGS) $(COMMON) -c $(SRC) -o $(BUILD)/$(BASE).$(VARIANT).o
+	$(LD) -r -T $(SDK)/app.ld $(BUILD)/$(BASE).$(VARIANT).o -o $(BUILD)/$(BASE).$(VARIANT).elf
+	@rm -f $(BUILD)/$(BASE).$(VARIANT).o
 
 clean:
 	rm -rf $(BUILD)
