@@ -2,7 +2,7 @@
   "id": "rfid",
   "name": "RFID",
   "author": "Fantasi",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "category": "RFID",
   "description": "Crack, read, write, sniff, and emulate RFID tags."
 }

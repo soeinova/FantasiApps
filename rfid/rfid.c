@@ -86,6 +86,7 @@ static void join3(char *dst, int cap, const char *a, const char *b, const char *
  * A chunked host upload otherwise races the poll - returning at the first size >= 0 would hand app_load a
  * partial ELF (its section headers sit past the truncated end). Two consecutive
  * equal, non-negative sizes means the upload has settled. */
+// TODO: Mutex or other lock to reduce polling time and eliminate race conditions here - noproto
 static int obtain_wait(const fantasi_api_t *api, const char *path)
 {
     int prev = -2;
@@ -201,11 +202,7 @@ static int obtain_sniff(const fantasi_api_t *api)
 {
     if (api->file_size(SNIFF_MOD_PATH) >= 0) return 1;
     api->request_module(SNIFF_MOD_KEY);
-    for (int waited = 0; api->file_size(SNIFF_MOD_PATH) < 0; ) {
-        if (++waited > FETCH_LIMIT) return 0;
-        api->delay(POLL_MS);
-    }
-    return 1;
+    return obtain_wait(api, SNIFF_MOD_PATH);
 }
 
 /* `sniff hf`: passively capture a live 13.56 MHz reader<->card exchange. Hot-loads the HF sniff
