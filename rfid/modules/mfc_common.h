@@ -15,8 +15,7 @@
 #include "app_api.h"
 #include "app_rfid.h"
 
-#define MFC_SECTORS 18                    /* MIFARE Classic 1K EV1 (16 user + 2 signature); a plain 1K just
-                                           * leaves sectors 16-17 unsolved (nested auth to them gets no reply) */
+#define MFC_SECTORS 16                    /* MIFARE Classic 1K: 16 sectors x 4 blocks, two keys per sector */
 #define KEY_NONE 0xFFFFFFFFFFFFFFFFULL     /* sentinel: a Key A/B slot not yet recovered */
 #define MFC_COLLECT 8                      /* nested nonces harvested per unsolved slot (enough for the hard
                                            * parity filter; the host uses 1 on a weak PRNG, all 8 on a hard one) */
@@ -141,11 +140,26 @@ static inline int is_weak_prng_nonce(uint32_t nonce)
 static uint32_t be32(const uint8_t *b) { return (uint32_t)b[0] << 24 | (uint32_t)b[1] << 16 | (uint32_t)b[2] << 8 | b[3]; }
 
 /* Uppercase-hex-encode n bytes into out (needs 2n+1). One small loop replaces many-arg %02X printfs. */
-static void put_hex(char *out, const uint8_t *b, int n)
+static __attribute__((unused)) void put_hex(char *out, const uint8_t *b, int n)
 {
     static const char H[] = "0123456789ABCDEF";
     for (int i = 0; i < n; i++) { out[i * 2] = H[b[i] >> 4]; out[i * 2 + 1] = H[b[i] & 15]; }
     out[n * 2] = 0;
+}
+
+static __attribute__((unused)) int mfc_parse_key12(const uint8_t *s, uint64_t *key)
+{
+    uint64_t v = 0;
+    for (int i = 0; i < 12; i++) {
+        uint8_t c = s[i], n;
+        if (c >= '0' && c <= '9') n = c - '0';
+        else if (c >= 'A' && c <= 'F') n = c - 'A' + 10;
+        else if (c >= 'a' && c <= 'f') n = c - 'a' + 10;
+        else return 0;
+        v = v << 4 | n;
+    }
+    *key = v;
+    return 1;
 }
 
 /* ISO14443-A CRC (poly 0x8408, preset 0x6363), written LSB then MSB after `d[0..n]`. */
@@ -160,39 +174,34 @@ static void crc_a(const uint8_t *d, int n, uint8_t *out)
     out[0] = (uint8_t)crc; out[1] = (uint8_t)(crc >> 8);
 }
 
-/* ---- ISO14443-A activation (WUPA so a HALTed card re-wakes) ---- */
-/* Fills uid[0..3] + *sak + atqa[0..1] for a 4-byte-UID card. Returns 0, or -1 (no card / 7-byte UID). */
+/* ---- ISO14443-A activation ---- */
+/* Use the firmware's common selector rather than carrying a subtly different
+ * anticollision implementation in every MFC module.  A failed authentication
+ * normally returns a Classic tag to IDLE, so the selector's REQA works on the
+ * fast path.  If the tag was instead left HALTed or mid-crypto, one field cycle
+ * returns it to IDLE before the bounded retry. */
 static int mfc_activate(const fantasi_rfid_t *r, const fantasi_api_t *api, uint8_t uid[4], uint8_t *sak, uint8_t atqa[2])
 {
-    (void)api;
-    uint8_t rx[16], wupa = 0x52;
-    int rb = r->hf_transceive(&wupa, 7, 0, rx, sizeof rx, 0);
-    if (rb < 0) {
-        uint8_t halt[4] = { 0x50, 0x00, 0, 0 }; crc_a(halt, 2, halt + 2);
-        r->hf_transceive(halt, 32, 0, rx, sizeof rx, 0);       /* HALT (no reply) */
-        rb = r->hf_transceive(&wupa, 7, 0, rx, sizeof rx, 0);
+    uint8_t full_uid[10], a[2];
+    int uid_len, cascade;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        uid_len = 0;
+        if (r->iso14443a_select(full_uid, &uid_len, sak, a, &cascade) == 0) {
+            if (uid_len != 4) return -1;
+            for (int i = 0; i < 4; i++) uid[i] = full_uid[i];
+            if (atqa) { atqa[0] = a[0]; atqa[1] = a[1]; }
+            return 0;
+        }
+        r->field(0); api->delay(2);
+        r->field(1); api->delay(2);
     }
-    if (rb < 16) return -1;
-    if (atqa) { atqa[0] = rx[0]; atqa[1] = rx[1]; }
-
-    uint8_t ac[2] = { 0x93, 0x20 };                        /* anticollision, cascade level 1 */
-    if (r->hf_transceive(ac, 16, 0, rx, sizeof rx, 0) < 40) return -1;   /* -> UID0..3 + BCC */
-    if (rx[0] == 0x88) return -1;                          /* cascade tag = 7-byte UID: not handled here */
-    for (int i = 0; i < 4; i++) uid[i] = rx[i];
-
-    uint8_t sel[9] = { 0x93, 0x70, rx[0], rx[1], rx[2], rx[3], rx[4], 0, 0 };
-    crc_a(sel, 7, sel + 7);
-    uint8_t sk[8];
-    int n = r->hf_transceive(sel, 72, 0, sk, sizeof sk, 0);
-    if (n < 8) return -1;                                  /* -> SAK + CRC */
-    if (sak) *sak = sk[0];
-    return 0;
+    return -1;
 }
 
 /* ---- Crypto1 auth (AUTH_FIRST). Assumes the card is already selected. Leaves *cs post-auth. Returns 0 on
  * success, -1 on a wrong key (the tag answered with a nonce but the handshake failed), or -2 when the tag
- * sent no nonce at all - i.e. that sector/block doesn't exist on this card (a dict sweep uses -2 to skip
- * non-existent sectors instead of retrying them for every key). ---- */
+ * sent no nonce. Every sector addressed by the 1K reader exists, so -2 is RF/card loss, not an "absent"
+ * sector inferred from one failed exchange. ---- */
 static int mfc_auth(const fantasi_rfid_t *r, uint32_t uid, uint8_t block, int keytype, uint64_t key, c1_t *cs)
 {
     uint8_t cmd[4] = { (uint8_t)(0x60 + (keytype & 1)), block, 0, 0 };

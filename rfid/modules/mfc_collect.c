@@ -44,8 +44,11 @@ int app_main(const fantasi_api_t *api)
         have_key = cfg[0] & 1;
         for (int i = 0; i < 6; i++) cfg_key = cfg_key << 8 | cfg[1 + i];
     }
+    api->remove(MFC_CFG_PATH);                    /* parsed: release the RAMFS staging file before RF work */
 
     if (r->set_mode(FANTASI_RFID_HF_READER) != 0) { api->print("collect: HF frontend unavailable\r\n"); return 0; }
+    r->field(1);
+    api->delay(10);                       /* match search/read card power-up before the first WUPA */
 
     uint8_t uid[4], sak = 0, atqa[2] = {0};
     if (mfc_activate(r, api, uid, &sak, atqa) != 0) {
@@ -57,7 +60,12 @@ int app_main(const fantasi_api_t *api)
     api->printf("collect: found MIFARE Classic uid=%s sak=%02X atqa=%02X%02X\r\n", uh, sak, atqa[1], atqa[0]);
 
     int nonweak = 0, nsamp = 0; uint32_t nt;
-    for (int i = 0; i < 5; i++) if (mfc_get_nt(r, api, &nt) == 0) { nsamp++; if (!is_weak_prng_nonce(nt)) nonweak++; }
+    for (int i = 0; i < 5; i++) {
+        if (mfc_get_nt(r, api, &nt) == 0) { nsamp++; if (!is_weak_prng_nonce(nt)) nonweak++; }
+        /* mfc_get_nt deliberately stops after AUTH's nonce, leaving the card in
+         * its crypto handshake. Reset it before the next independent sample. */
+        r->field(0); api->delay(2); r->field(1); api->delay(2);
+    }
     int hard = (nonweak >= 3);
     if (nsamp && !hard) { r->set_mode(FANTASI_RFID_OFF);
         api->print("collect: weak-PRNG nonce logging needs timing calibration (not implemented yet)\r\n"); return 0; }

@@ -25,6 +25,7 @@ int app_main(const fantasi_api_t *api)
         api->print("t5577: LF not supported on this device\r\n"); return 0;
     }
     if (!r->lf_transceive) { api->print("t5577: read not supported\r\n"); return 0; }
+    api->print("reading: detecting T5577 card\r\n");
     if (r->set_mode(FANTASI_RFID_LF_READER) != 0) { api->print("t5577: LF frontend unavailable\r\n"); return 0; }
 
     /* Ephemeral capture buffer - freed before return, so the raw samples never pin the tight PM3 heap. */
@@ -39,6 +40,7 @@ int app_main(const fantasi_api_t *api)
     uint32_t v;
     int framed = 0;
     for (int i = 0; i < 11; i++) {
+        api->printf("reading: block %d/11\r\n", i + 1);
         api->delay(T55_RESET_MS);                          /* drain/reset the tag before this block's read */
         int rc = t55_read_block(r, buf, hbit, PG[i], BK[i], &v);
         if (rc == 0) { framed = 1; api->printf("t5577: p%d b%d = %08X\r\n", PG[i], BK[i], (unsigned)v); }
@@ -51,5 +53,6 @@ int app_main(const fantasi_api_t *api)
 
     r->set_mode(FANTASI_RFID_OFF);
     api->free(buf);
+    api->print("reading: complete\r\n");
     return 1;
 }

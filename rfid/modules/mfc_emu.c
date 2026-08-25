@@ -1,4 +1,4 @@
-/* rfid feature module: MIFARE Classic 1K tag emulation (`emulate mfc <json>`).
+/* rfid feature module: MIFARE Classic 1K tag emulation (`emulate mfc`).
  *
  * Emulates a MIFARE Classic 1K card from a 1024-byte image (64 blocks x 16 B; sector trailers carry the
  * keys) staged at /ramfs/mfc_emu.bin by the host. The HAL does only the real-time bit I/O + FDT

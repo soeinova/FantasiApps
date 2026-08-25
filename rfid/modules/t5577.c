@@ -1,8 +1,7 @@
 /* rfid feature module: T5577 (ATA5577) LF read/write.
  *
- * Hot-loaded by the rfid driver for `raw t5577 <block> [<hex32>]`. The request text is "<block>" with
- * an optional 32-bit hex value; the value's presence picks the operation, exactly like `hf 14a raw`
- * carries frame-or-none:
+ * Hot-loaded by the rfid driver for `read t5577` / `write t5577`. The private request text is "<block>"
+ * with an optional 32-bit hex value; the value's presence picks the operation:
  *   - with data  -> WRITE: pack the "fixed bit length" downlink (opcode 10 page-0, no password + lock
  *                   + 32-bit data + 3-bit block address) and send it via fantasi_rfid()->lf_modulate.
  *   - no data    -> READ:  send the read downlink; the HAL streams the reply as inter-edge run lengths
@@ -24,7 +23,7 @@ int app_main(const fantasi_api_t *api)
 
     char req[48];
     int rn = api->read_file(T5577_REQ, req, sizeof req - 1);
-    if (rn < 1) { api->print("usage: raw t5577 <block 0-7> [<hex32>]\r\n"); return 0; }
+    if (rn < 1) { api->print("t5577: missing block request\r\n"); return 0; }
     req[rn] = '\0';
 
     const char *p = req;
@@ -37,13 +36,31 @@ int app_main(const fantasi_api_t *api)
     int page = 0;
     uint32_t data = 0; int nd = 0;
     while (*p == ' ') p++;
-    if (*p == 'p' || *p == 'P') { p++; if (*p >= '0' && *p <= '1') page = *p - '0'; }
-    else for (; *p; p++) { int v = hexnib(*p); if (v < 0) continue; data = (data << 4) | (uint32_t)v; nd++; }
+    if (*p == 'p' || *p == 'P') {
+        p++;
+        if ((*p != '0' && *p != '1') || p[1] != '\0') {
+            api->print("t5577: page must be p0 or p1\r\n"); return 0;
+        }
+        page = *p - '0';
+    } else {
+        for (; *p; p++) {
+            int v = hexnib(*p);
+            if (v < 0 || nd >= 8) {
+                api->print("t5577: data must be exactly 8 hex digits\r\n"); return 0;
+            }
+            data = (data << 4) | (uint32_t)v;
+            nd++;
+        }
+        if (nd != 0 && nd != 8) {
+            api->print("t5577: data must be exactly 8 hex digits\r\n"); return 0;
+        }
+    }
 
     if (r->set_mode(FANTASI_RFID_LF_READER) != 0) { api->print("t5577: LF frontend unavailable\r\n"); return 0; }
 
     if (nd == 0) {                                              /* no data -> READ the block back */
         if (!r->lf_transceive) { r->set_mode(FANTASI_RFID_OFF); api->print("t5577: read not supported\r\n"); return 0; }
+        api->printf("reading: T5577 page %d block %d\r\n", page, block);
 
         /* Ephemeral capture buffer - allocated only for this read, freed before return, so the ~6 KB of raw
          * samples never pins the tight PM3 heap between commands. */

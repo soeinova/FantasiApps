@@ -37,9 +37,6 @@
 #endif
 #define FETCH_LIMIT 100    /* ~5 s for a requested module to arrive */
 #define POLL_MS     50
-#define RFID_FPGA_RDY "/ramfs/fpga.rdy"   /* host writes this (ramfs) once a bitstream
-                                           * finishes committing to /fpga (lfs); must
-                                           * match cli/commands/rfid.c */
 
 static int streq(const char *a, const char *b) { while (*a && *b) { if (*a++ != *b++) return 0; } return *a == *b; }
 
@@ -59,6 +56,12 @@ static int pop_word(const char **pp, const char *w)
 static int s_field;    /* the driver's view of the reader carrier (1 = on); `field status` reports it, and
                         * the field-changing commands (field/raw/search/sniff) keep it current */
 
+static __attribute__((noinline)) void frontend_off(const fantasi_rfid_t *r)
+{
+    if (r) r->set_mode(FANTASI_RFID_OFF);
+    s_field = 0;
+}
+
 /* Bands to scan, in order. key names the module the host streams; path is the
  * /ramfs slot it lands in (host convention: /ramfs/rfid_<key>); mode is the RFID
  * mode whose FPGA bitstream (if any) must be provisioned before the module runs. */
@@ -67,6 +70,8 @@ static const struct { const char *key, *label, *path; int mode; } BANDS[] = {
     { "lf", "LF", "/ramfs/rfid_lf", FANTASI_RFID_LF_READER },
 };
 #define NBANDS ((int)(sizeof BANDS / sizeof BANDS[0]))
+#define HF_BAND 0
+#define LF_BAND 1
 
 /* dst = a + b + c, truncated to cap (no libc strcat/snprintf in module land). */
 static void join3(char *dst, int cap, const char *a, const char *b, const char *c)
@@ -82,28 +87,31 @@ static void join3(char *dst, int cap, const char *a, const char *b, const char *
  * the host to stream it over the session's protobuf channel and wait for it to
  * land. Returns 1 if the module is now resident, 0 if it never arrived (no host /
  * host lacks it). Nothing is pre-staged; the caller deletes it after use. */
-/* Wait for a requested module file to be fully delivered: poll until its size appears and stops growing.
- * A chunked host upload otherwise races the poll - returning at the first size >= 0 would hand app_load a
- * partial ELF (its section headers sit past the truncated end). Two consecutive
- * equal, non-negative sizes means the upload has settled. */
-// TODO: Mutex or other lock to reduce polling time and eliminate race conditions here - noproto
 static int obtain_wait(const fantasi_api_t *api, const char *path)
 {
-    int prev = -2;
-    for (int waited = 0; ; ) {
-        int sz = (int)api->file_size(path);
-        if (sz >= 0 && sz == prev) return 1;            /* delivered + stable */
-        prev = sz;
-        if (++waited > FETCH_LIMIT) return sz >= 0 ? 1 : 0;
+    for (int waited = 0; api->file_size(path) < 0; ) {
+        if (++waited > FETCH_LIMIT) return 0;
         api->delay(POLL_MS);
     }
+    return 1;
+}
+
+static int request_module(const fantasi_api_t *api, const char *key, const char *path)
+{
+    if (api->file_size(path) >= 0) return 1;
+    api->request_module(key);
+    if (!obtain_wait(api, path)) return 0;
+    /* Publication happens on the protobuf session worker. Give it one polling
+     * interval to send the rename ACK and retire before executing the detached
+     * RAMFS image; on PM3 this releases that worker's 3.5 KB stack while the
+     * feature module is resident. */
+    api->delay(POLL_MS);
+    return 1;
 }
 
 static int obtain_module(const fantasi_api_t *api, int b)
 {
-    if (api->file_size(BANDS[b].path) >= 0) return 1;   /* already here */
-    api->request_module(BANDS[b].key);                  /* JIT request to the host */
-    return obtain_wait(api, BANDS[b].path);
+    return request_module(api, BANDS[b].key, BANDS[b].path);
 }
 
 /* Ensure band b's FPGA bitstream is cached under /fpga (Proxmark3 only). If the
@@ -123,22 +131,9 @@ static int obtain_fpga(const fantasi_api_t *api, int b)
     if (api->file_size(path) >= 0) return 1;            /* already cached */
 
     api->mkdir("/fpga");
-    api->remove(RFID_FPGA_RDY);                         /* clear any stale marker */
     join3(name, sizeof name, "fpga/", res, "");         /* host maps "fpga/<res>" -> the .z */
     api->request_module(name);
-
-    /* Poll a ramfs ready marker, not the lfs bitstream. The host writes the marker
-     * only after the ~28 KB .z is fully committed to LittleFS, so (a) we never treat
-     * a half-uploaded file as done, and (b) we never open the lfs file while the
-     * file-write task is committing it - the two tasks share one lfs_t with no lock,
-     * so a concurrent open would clobber its shared caches. Modules are polled in
-     * ramfs for exactly this reason; the bitstream just persists in lfs instead. */
-    for (int waited = 0; api->file_size(RFID_FPGA_RDY) < 0; ) {
-        if (++waited > FETCH_LIMIT) return 0;
-        api->delay(POLL_MS);
-    }
-    api->remove(RFID_FPGA_RDY);
-    return 1;
+    return obtain_wait(api, path);
 }
 
 /* Print the lines a module just wrote to the scan file, each prefixed with a
@@ -172,18 +167,22 @@ static void scan(const fantasi_api_t *api, const char *args)
     /* optional <target>: restrict to one band; bare = every band. BANDS[0]=HF, [1]=LF. */
     int only = -1;
     if (*args) {
-        if (streq(args, "nfca") || streq(args, "hf")) only = 0;
+        if (streq(args, "hf")) only = 0;                /* search scopes by BAND (hf/lf), never a protocol */
         else if (streq(args, "lf")) only = 1;
-        else { api->printf("search: unknown target '%s' (try: nfca, lf)\r\n", args); return; }
+        else { api->printf("search: unknown band '%s' (try: hf, lf)\r\n", args); return; }
     }
     api->print("scanning...\r\n");
     int total = 0;
     for (int b = 0; b < NBANDS; b++) {
         if (only >= 0 && b != only) continue;
         if (!obtain_module(api, b)) { api->print("disconnected: rfid modules unavailable\r\n"); return; }
-        if (!obtain_fpga(api, b))   { api->print("disconnected: fpga bitstream unavailable\r\n"); return; }
+        if (!obtain_fpga(api, b)) {
+            api->remove(BANDS[b].path);
+            api->print("disconnected: fpga bitstream unavailable\r\n"); return;
+        }
         api->remove(RFID_SCAN_FILE);
         fantasi_run_module(BANDS[b].path, api, true);   /* frees the module file; writes RFID_SCAN_FILE */
+        frontend_off(fantasi_rfid());
         total += list_found(api, total);
         api->remove(BANDS[b].path);               /* no-op unless the load failed: run_module frees it */
     }
@@ -200,21 +199,22 @@ static void scan(const fantasi_api_t *api, const char *args)
  * lingers as a heap island); a no-op re-fetch when it is somehow still present. */
 static int obtain_sniff(const fantasi_api_t *api)
 {
-    if (api->file_size(SNIFF_MOD_PATH) >= 0) return 1;
-    api->request_module(SNIFF_MOD_KEY);
-    return obtain_wait(api, SNIFF_MOD_PATH);
+    return request_module(api, SNIFF_MOD_KEY, SNIFF_MOD_PATH);
 }
 
-/* `sniff hf`: passively capture a live 13.56 MHz reader<->card exchange. Hot-loads the HF sniff
+/* `sniff <protocol>`: passively capture a live reader<->card exchange. Hot-loads the HF sniff
  * module (which owns the capture loop + its scratch and streams the decoded trace), then deletes
- * it. Trigger a reader while it runs; any key (or Ctrl-C) stops it. The band arg keeps room for a
- * future `sniff lf`; bare `sniff` defaults to hf since it's the only one today. */
+ * it. Trigger a reader while it runs; any key (or Ctrl-C) stops it. An explicit target is required
+ * so adding LF sniffing later cannot silently change what a bare command means. */
 static void do_sniff(const fantasi_api_t *api, const char *args)
 {
     /* <target>: the RF category to sniff. Only NFC-A (HF) has a sniffer on this build;
-     * bare / "nfca" / "hf" all select it. Protocol targets (mfc, ul, ...) resolve to a
-     * category host-side, so the device only ever sees the category token. */
-    if (args[0] && !streq(args, "nfca") && !streq(args, "hf")) {
+     * protocol targets (mfc, ul, ...) resolve to a category host-side, so the
+     * device normally sees `nfca`; `hf` remains an explicit direct-app alias. */
+    if (!args[0]) {
+        api->print("usage: sniff <protocol>\r\n"); return;
+    }
+    if (!streq(args, "nfca") && !streq(args, "hf")) {
         api->printf("sniff: '%s' not supported (try: nfca)\r\n", args); return;
     }
 
@@ -225,17 +225,21 @@ static void do_sniff(const fantasi_api_t *api, const char *args)
     /* Warm the HF bitstream first, before obtain_sniff puts the module file in ramfs, so fpga_load's
      * transient 4 KB config window allocates against the freest heap (same ordering fix as do_raw -
      * with the module file resident the window can't find 4 KB contiguous on the tight PM3 heap). */
+    if (!obtain_fpga(api, HF_BAND)) { api->print("disconnected: fpga bitstream unavailable\r\n"); return; }
     if (r->set_mode(FANTASI_RFID_HF_READER) != 0) { api->print("sniff: HF frontend unavailable\r\n"); return; }
 
-    if (!obtain_sniff(api)) { api->print("disconnected: sniff module unavailable\r\n"); return; }
+    if (!obtain_sniff(api)) {
+        frontend_off(r);
+        api->remove(SNIFF_MOD_PATH);
+        api->print("disconnected: sniff module unavailable\r\n"); return;
+    }
 
     fantasi_run_module(SNIFF_MOD_PATH, api, true);   /* true: free the file - sniff needs the heap */
 
     /* The module releases the frontend itself, but force off here too so an early module exit (e.g.
      * OOM) can't leave the reader mode latched. The module file is normally already gone (run_module
      * frees it as soon as the image is resident); this remove only catches the load-failed path. */
-    r->set_mode(FANTASI_RFID_OFF);
-    s_field = 0;
+    frontend_off(r);
     api->remove(SNIFF_MOD_PATH);
 }
 
@@ -268,44 +272,44 @@ static int hexval(char c)
  * it never lingers as a heap island); a no-op re-fetch when it is somehow still present. */
 static int obtain_raw(const fantasi_api_t *api)
 {
-    if (api->file_size(RAW_MOD_PATH) >= 0) return 1;
-    api->request_module(RAW_MOD_KEY);
-    for (int waited = 0; api->file_size(RAW_MOD_PATH) < 0; ) {
-        if (++waited > FETCH_LIMIT) return 0;
-        api->delay(POLL_MS);
-    }
-    return 1;
+    return request_module(api, RAW_MOD_KEY, RAW_MOD_PATH);
 }
 
-/* ---- LF T5577 raw write (its own hot-loaded module + LF bitstream) ---- */
+/* ---- LF T5577 block read/write (its own hot-loaded module + LF bitstream) ---- */
 #define T5577_MOD_KEY  "t5577"
 #define T5577_MOD_PATH "/ramfs/rfid_t5577"
 #define T5577_REQ      "/ramfs/.t5577req"      /* driver -> module: "<block> <hex32>" text */
-#define LF_BAND        1                       /* BANDS[1] = LF (for its FPGA bitstream) */
 
 static int obtain_t5577(const fantasi_api_t *api)
 {
-    if (api->file_size(T5577_MOD_PATH) >= 0) return 1;
-    api->request_module(T5577_MOD_KEY);
-    return obtain_wait(api, T5577_MOD_PATH);
+    return request_module(api, T5577_MOD_KEY, T5577_MOD_PATH);
 }
 
-/* `raw t5577 <block> <hex32>`: LF T5577 block write. The protocol lives entirely in the hot-loaded
+/* `read t5577 <block>` / `write t5577 <block> <hex32>`. The protocol lives entirely in the hot-loaded
  * t5577 module (which prints its own result); the driver just provisions the LF bitstream, pre-warms
- * it (freest-heap ordering, like do_raw), hands the module its request text, runs it, self-cleans. */
-static void do_raw_t5577(const fantasi_api_t *api, const char *args)
+ * it (freest-heap ordering), hands the module its request text, runs it, and self-cleans. */
+static void do_t5577_block(const fantasi_api_t *api, const char *args)
 {
     const fantasi_rfid_t *r = fantasi_rfid();
     if (!r || !r->lf_modulate) { api->print("t5577: LF transmit not supported on this device\r\n"); return; }
     if (!obtain_fpga(api, LF_BAND)) { api->print("disconnected: fpga bitstream unavailable\r\n"); return; }
     /* Warm the LF bitstream first, before obtain_t5577 stages the module file (heap ordering). */
     if (r->set_mode(FANTASI_RFID_LF_READER) != 0) { api->print("t5577: LF frontend unavailable\r\n"); return; }
-    if (!obtain_t5577(api)) { api->print("disconnected: t5577 module unavailable\r\n"); return; }
+    if (!obtain_t5577(api)) {
+        frontend_off(r);
+        api->remove(T5577_MOD_PATH);
+        api->print("disconnected: t5577 module unavailable\r\n"); return;
+    }
 
     int len = 0; while (args[len]) len++;                  /* no libc strlen in module/driver land */
-    api->write_file(T5577_REQ, args, (uint32_t)len);
+    api->remove(T5577_REQ);
+    if (api->write_file(T5577_REQ, args, (uint32_t)len) != 0) {
+        api->remove(T5577_MOD_PATH);
+        frontend_off(r);
+        api->print("t5577: cannot stage request\r\n"); return;
+    }
     fantasi_run_module(T5577_MOD_PATH, api, true);
-    s_field = 0;                                           /* the module powers the LF field down */
+    frontend_off(r);
 
     api->remove(T5577_REQ);                                /* self-clean, like do_raw */
     api->remove(T5577_MOD_PATH);
@@ -317,93 +321,158 @@ static void do_raw_t5577(const fantasi_api_t *api, const char *args)
 
 static int obtain_t5577_dump(const fantasi_api_t *api)
 {
-    if (api->file_size(T5577_DUMP_MOD_PATH) >= 0) return 1;
-    api->request_module(T5577_DUMP_MOD_KEY);
-    return obtain_wait(api, T5577_DUMP_MOD_PATH);
+    return request_module(api, T5577_DUMP_MOD_KEY, T5577_DUMP_MOD_PATH);
 }
 
-/* `raw t5577dump`: read every physical T5577 block in one module invocation - provision the LF bitstream
+/* Bare `read t5577`: read every physical T5577 block in one module invocation - provision the LF bitstream
  * and module once, then the module calibrates the block boundary once and reads all blocks, printing one
- * `t5577: p<page> b<block> = ...` line each. The host's bare `read t5577` sends this instead of looping 11
- * `raw t5577 N` commands (whose per-command module round-trip stalls on the transport). Self-cleans. */
-static void do_raw_t5577_dump(const fantasi_api_t *api)
+ * `t5577: p<page> b<block> = ...` line each instead of making 11 module round-trips. Self-cleans. */
+static void do_t5577_dump(const fantasi_api_t *api)
 {
     const fantasi_rfid_t *r = fantasi_rfid();
     if (!r || !r->lf_transceive) { api->print("t5577: LF read not supported on this device\r\n"); return; }
+    api->print("reading: preparing T5577 reader\r\n");
     if (!obtain_fpga(api, LF_BAND)) { api->print("disconnected: fpga bitstream unavailable\r\n"); return; }
     if (r->set_mode(FANTASI_RFID_LF_READER) != 0) { api->print("t5577: LF frontend unavailable\r\n"); return; }
-    if (!obtain_t5577_dump(api)) { api->print("disconnected: t5577 dump module unavailable\r\n"); return; }
+    if (!obtain_t5577_dump(api)) {
+        frontend_off(r);
+        api->remove(T5577_DUMP_MOD_PATH);
+        api->print("disconnected: t5577 dump module unavailable\r\n"); return;
+    }
 
     fantasi_run_module(T5577_DUMP_MOD_PATH, api, true);
-    s_field = 0;                                           /* the module powers the LF field down */
+    frontend_off(r);
     api->remove(T5577_DUMP_MOD_PATH);
 }
 
-/* ---- HF MIFARE Classic read: two hot-loaded /ramfs modules + HF bitstream ---- */
-/* Split into a collect phase (PRNG sample, bootstrap a key, harvest nested nonces) and a read phase (auth +
- * block dump with host-solved keys). The offline work - PRNG classification and the dictionary match - runs
- * on the host, which also holds the dictionary, so the device carries neither the dict nor the matcher. Two
- * small modules each fit the /ramfs load budget. */
+/* ---- HF MIFARE Classic collect/read: hot-loaded /ramfs modules + HF bitstream ---- */
+/* Collection streams nested nonces to the host for offline solving; reading independently streams the two
+ * on-device dictionaries one record at a time, authenticates and dumps the card. Keeping these as separate
+ * modules means only the active phase occupies the tight PM3 module-load budget. */
 #define MFCC_MOD_KEY  "mfc_collect"
-/* On LittleFS (flash), not /ramfs: the collect module carries the whole Hardnested collection state machine
- * (256-MSB coupon-collector loop, valid-sum check, nonce formatter) and is inherently ~5.5 KB - too big for
- * the fragmented /ramfs load budget, and its 256-nonce/target volume can't be formatted host-side through the
- * capture channel. Reading the ELF from flash keeps it off the heap during load. The read module is small and
- * stays in /ramfs; only this genuinely-large gather module needs flash. */
-#define MFCC_MOD_PATH "/rfid_mfcc"
+#define MFCC_MOD_PATH "/ramfs/rfid_mfcc"
 #define MFCR_MOD_KEY  "mfc_read"
-/* Also on LittleFS (flash), not /ramfs: the read module carries the PRNG profiler + crypto1 (auth,
- * filter, prng_successor) alongside dict_check and the block dump, so its ELF is ~7 KB. Staged in /ramfs that ELF
- * would be heap, and heap + the ~5 KB load image together don't fit as a nested module. Reading from
- * flash keeps the ELF off the heap during load, exactly like the collect module above. */
-#define MFCR_MOD_PATH "/rfid_mfcr"
-#define HF_BAND      0                         /* BANDS[0] = HF (for its FPGA bitstream) */
+#define MFCR_MOD_PATH "/ramfs/rfid_mfcr"
+#define MFCB_MOD_KEY  "mfc_block"
+#define MFCB_MOD_PATH "/ramfs/rfid_mfcb"
+#define MFCR_REQ      "/ramfs/.mfcrreq"   /* block reader: "BLOCK [KEY]" */
+#define MFCR_KEY      "/ramfs/.mfckey"    /* full reader: one preferred 12-hex key record */
 
 static int obtain_named(const fantasi_api_t *api, const char *key, const char *path)
 {
-    if (api->file_size(path) >= 0) return 1;
-    api->request_module(key);
-    for (int waited = 0; api->file_size(path) < 0; ) {
-        if (++waited > FETCH_LIMIT) return 0;
-        api->delay(POLL_MS);
-    }
-    return 1;
+    return request_module(api, key, path);
 }
 
-/* `raw mfc collect` / `raw mfc read`: run one phase's module. The host orchestrates the two calls (collect ->
- * solve keys offline -> write the mfc_read keyfile -> read), provisioning the HF bitstream once. */
-static void do_mfc(const fantasi_api_t *api, int phase)
+static __attribute__((noinline)) void clear_mfc_read_args(const fantasi_api_t *api)
+{
+    api->remove(MFCR_REQ);
+    api->remove(MFCR_KEY);
+}
+
+/* `collect mfc card` / `read mfc [request]`: run exactly the requested phase, provisioning HF before its
+ * module is requested so the PM3 decompression window never competes with the RAMFS ELF. `request` is empty
+ * for a normal full read, `all KEY` for a preferred full-read key, or `BLOCK [KEY]` for one block. */
+static void do_mfc(const fantasi_api_t *api, int phase, const char *request)
 {
     const fantasi_rfid_t *r = fantasi_rfid();
     if (!r) { api->print("mfc: not supported\r\n"); return; }
+    int block_read = phase && request && request[0] &&
+                     !(request[0] == 'a' && request[1] == 'l' && request[2] == 'l' &&
+                       (request[3] == '\0' || request[3] == ' '));
+    const char *preferred = 0;
+    if (phase && !block_read && request && request[0] && request[3] == ' ')
+        preferred = request + 4;                           /* host has already validated the key record */
+    if (phase) api->print("reading: preparing MIFARE Classic reader\r\n");
     if (!obtain_fpga(api, HF_BAND)) { api->print("disconnected: fpga bitstream unavailable\r\n"); return; }
-    /* NOTE: do not set_mode(HF) here - the FPGA load needs a ~4 KB contiguous LZSS window, and the module
-     * ELF is still resident in ramfs at this point, fragmenting the heap. fantasi_run_module frees the ELF
-     * right after loading, so the module's own set_mode(HF) runs with room for the window. */
-    const char *key  = phase ? MFCR_MOD_KEY  : MFCC_MOD_KEY;
-    const char *path = phase ? MFCR_MOD_PATH : MFCC_MOD_PATH;
-    if (!obtain_named(api, key, path)) { api->print("disconnected: mfc module unavailable\r\n"); return; }
-    fantasi_run_module(path, api, true);
-    s_field = 0;                                           /* the module powers HF down */
+    /* Configure the FPGA before requesting the module. PM3 needs a transient
+     * 4.5 KB decompression window; allocating it while the RAMFS module is
+     * resident fragments the tight heap. The module's own set_mode(HF) is then
+     * a no-op because the frontend is already ready. */
+    if (r->set_mode(FANTASI_RFID_HF_READER) != 0) {
+        api->print("mfc: HF frontend unavailable\r\n"); return;
+    }
+    const char *key  = !phase ? MFCC_MOD_KEY : block_read ? MFCB_MOD_KEY : MFCR_MOD_KEY;
+    const char *path = !phase ? MFCC_MOD_PATH : block_read ? MFCB_MOD_PATH : MFCR_MOD_PATH;
+    if (phase) clear_mfc_read_args(api);                   /* never reuse another session's request/key */
+    if (!obtain_named(api, key, path)) {
+        frontend_off(r);
+        api->remove(path);
+        if (phase) clear_mfc_read_args(api);
+        api->print("disconnected: mfc module unavailable\r\n"); return;
+    }
+    const char *arg_path = phase && block_read ? MFCR_REQ : preferred ? MFCR_KEY : 0;
+    const char *staged = block_read ? request : preferred;
+    if (arg_path) {
+        int len = 0; while (staged[len]) len++;
+        if (len && api->write_file(arg_path, staged, (uint32_t)len) != 0) {
+            api->remove(path);
+            clear_mfc_read_args(api);
+            frontend_off(r);
+            api->print("mfc: cannot stage read options\r\n"); return;
+        }
+    }
+    if (fantasi_run_module(path, api, true) < 0) {
+        api->print("mfc: module load failed\r\n");
+    }
+    frontend_off(r);                                       /* force cleanup even if the module returned early */
     api->remove(path);
+    if (phase) clear_mfc_read_args(api);
 }
 
 /* ---- HF MIFARE Classic tag emulation ---- */
 #define MFCE_MOD_KEY  "mfc_emu"
 #define MFCE_MOD_PATH "/ramfs/rfid_mfce"
 
-/* `raw mfcemu`: run the MIFARE Classic emulation module. The host has already staged the 1 KB card image at
+/* `emulate mfc`: run the MIFARE Classic emulation module. The host has already staged the 1 KB card image at
  * /ramfs/mfc_emu.bin; we provision the HF bitstream (the module's set_mode(HF_EMU) reuses it) and run the
  * module, which load-modulates as a tag until the user presses a key. Self-cleans. */
 static void do_emulate(const fantasi_api_t *api)
 {
     const fantasi_rfid_t *r = fantasi_rfid();
-    if (!r || !r->hf_emu_recv || !r->hf_emu_send) { api->print("emulate: not supported on this device\r\n"); return; }
-    if (!obtain_fpga(api, HF_BAND)) { api->print("disconnected: fpga bitstream unavailable\r\n"); return; }
-    if (!obtain_named(api, MFCE_MOD_KEY, MFCE_MOD_PATH)) { api->print("disconnected: emu module unavailable\r\n"); return; }
+    if (!r || !r->hf_emu_recv || !r->hf_emu_send) {
+        api->print("emulate: not supported on this device\r\n"); return;
+    }
+    if (!obtain_fpga(api, HF_BAND)) {
+        api->print("disconnected: fpga bitstream unavailable\r\n"); return;
+    }
+    if (!obtain_named(api, MFCE_MOD_KEY, MFCE_MOD_PATH)) {
+        api->remove(MFCE_MOD_PATH);
+        api->print("disconnected: emu module unavailable\r\n"); return;
+    }
     fantasi_run_module(MFCE_MOD_PATH, api, true);
-    s_field = 0;
+    frontend_off(r);
     api->remove(MFCE_MOD_PATH);
+}
+
+/* Host-side conveniences and the device app share the same verb boundary. These handlers are deliberately
+ * separate from `raw`: raw owns only literal RF frames, never module-control aliases. */
+static void do_read(const fantasi_api_t *api, const char *args)
+{
+    if (pop_word(&args, "t5577")) {
+        if (*args) do_t5577_block(api, args);
+        else do_t5577_dump(api);
+        return;
+    }
+    if (pop_word(&args, "mfc")) { do_mfc(api, 1, args); return; }
+    api->print("usage: read <protocol> [options]\r\n");
+}
+
+static void do_write(const fantasi_api_t *api, const char *args)
+{
+    if (pop_word(&args, "t5577") && *args) { do_t5577_block(api, args); return; }
+    api->print("usage: write <protocol> [options]\r\n");
+}
+
+static void do_collect(const fantasi_api_t *api, const char *args)
+{
+    if (pop_word(&args, "mfc") && pop_word(&args, "card") && !*args) { do_mfc(api, 0, 0); return; }
+    api->print("usage: collect <protocol> <mode> [options]\r\n");
+}
+
+static void do_emulate_cmd(const fantasi_api_t *api, const char *args)
+{
+    if (pop_word(&args, "mfc") && !*args) { do_emulate(api); return; }
+    api->print("usage: emulate <protocol> [options]\r\n");
 }
 
 /* Print buf[0..n) - the module's "<R|C> <hex>" frame lines - preceded by a `T`
@@ -432,15 +501,9 @@ static void do_raw(const fantasi_api_t *api, const char *args)
     uint8_t req[80];
     uint32_t flags = 0;
     int nb = 0, nib = -1;
-    /* optional leading <target>. "t5577" routes to the LF write module; "nfca"/"hf" select NFC-A
-     * raw (the default) and are consumed - so `raw -c 3000` / `raw 3000` still work. Other protocol
-     * tokens are mapped to their category host-side, so the device only sees nfca / t5577. */
+    /* Optional leading <target>. "nfca"/"hf" select NFC-A raw (the default) and are consumed, so
+     * `raw -c 3000` / `raw 3000` still work. Protocol tokens are mapped to their RF category host-side. */
     while (*args == ' ') args++;
-    if (pop_word(&args, "t5577dump")) { do_raw_t5577_dump(api); return; }   /* bare `read t5577` whole-tag dump */
-    if (pop_word(&args, "t5577")) { do_raw_t5577(api, args); return; }
-    if (pop_word(&args, "mfccollect")) { do_mfc(api, 0); return; }   /* host `collect mfc card` -> nonce log */
-    if (pop_word(&args, "mfcread"))    { do_mfc(api, 1); return; }   /* host `read mfc` -> dict dump */
-    if (pop_word(&args, "mfcemu"))     { do_emulate(api); return; }  /* host `emulate mfc` -> tag emulation */
     if (!pop_word(&args, "nfca")) pop_word(&args, "hf");
     for (const char *p = args; *p; p++) {
         if (*p == ' ') continue;
@@ -449,15 +512,24 @@ static void do_raw(const fantasi_api_t *api, const char *args)
                 if      (*p == 'c') flags |= RAW_F_CRC;
                 else if (*p == 'k') flags |= RAW_F_KEEP;
                 else if (*p == 's') flags |= RAW_F_SELECT;
+                else { api->printf("raw: unknown option '-%c'\r\n", *p); return; }
             }
             p--;
             continue;
         }
         int v = hexval(*p);
-        if (v < 0) continue;
+        if (v < 0) { api->printf("raw: invalid hex character '%c'\r\n", *p); return; }
         if (nib < 0) nib = v;
-        else if (nb < (int)sizeof req - 2) { req[2 + nb++] = (uint8_t)((nib << 4) | v); nib = -1; }
+        else {
+            if (nb >= (int)sizeof req - 2) {
+                api->printf("raw: frame too long (maximum %d bytes)\r\n", (int)sizeof req - 2);
+                return;
+            }
+            req[2 + nb++] = (uint8_t)((nib << 4) | v);
+            nib = -1;
+        }
     }
+    if (nib >= 0) { api->print("raw: hex input must contain whole bytes\r\n"); return; }
     if (nb == 0 && !(flags & RAW_F_SELECT)) {
         api->print("usage: raw [-c][-k][-s] <hex>   (-c add CRC, -k keep field on, -s select first)\r\n");
         return;
@@ -468,15 +540,26 @@ static void do_raw(const fantasi_api_t *api, const char *args)
      * no-op, so the module image and that window never occupy the heap together. Ordering matters:
      * with the module file already resident the window can't find 4 KB contiguous on the tight PM3
      * heap and set_mode returns RFID_ERR_UNSUPP -> the module aborts before it reads a card. */
-    { const fantasi_rfid_t *r = fantasi_rfid(); if (r) r->set_mode(FANTASI_RFID_HF_READER); }
-
-    if (!obtain_raw(api)) { api->print("disconnected: raw module unavailable\r\n"); return; }
+    const fantasi_rfid_t *r = fantasi_rfid();
+    if (!r) { api->print("raw: not supported on this device\r\n"); return; }
+    if (!obtain_fpga(api, HF_BAND)) { api->print("disconnected: fpga bitstream unavailable\r\n"); return; }
+    if (r->set_mode(FANTASI_RFID_HF_READER) != 0) { api->print("raw: HF frontend unavailable\r\n"); return; }
+    if (!obtain_raw(api)) {
+        frontend_off(r);
+        api->remove(RAW_MOD_PATH);
+        api->print("disconnected: raw module unavailable\r\n"); return;
+    }
 
     req[0] = (uint8_t)flags; req[1] = (uint8_t)nb;
-    api->remove(RAW_LAST);
-    api->write_file(RAW_REQ, req, (uint32_t)(2 + nb));
-    fantasi_run_module(RAW_MOD_PATH, api, true);
-    s_field = (flags & RAW_F_KEEP) ? 1 : 0;   /* the module leaves the field on only with -k */
+    api->remove(RAW_REQ); api->remove(RAW_LAST);
+    if (api->write_file(RAW_REQ, req, (uint32_t)(2 + nb)) != 0) {
+        api->remove(RAW_MOD_PATH);
+        frontend_off(r);
+        api->print("raw: cannot stage request\r\n"); return;
+    }
+    int module_rc = fantasi_run_module(RAW_MOD_PATH, api, true);
+    s_field = (module_rc >= 0 && (flags & RAW_F_KEEP)) ? 1 : 0;
+    if (module_rc < 0) frontend_off(r);
 
     /* Read back the module's trace through a transient heap buffer - allocated only for this
      * command and freed before return, so it costs nothing on the tight PM3 heap while other
@@ -508,6 +591,7 @@ static void do_raw(const fantasi_api_t *api, const char *args)
 static void do_trace(const fantasi_api_t *api, const char *args)
 {
     if (streq(args, "clear")) { s_tracelen = 0; api->print("trace cleared\r\n"); return; }
+    if (args[0] != '\0')      { api->print("usage: trace [clear]\r\n"); return; }
     if (s_tracelen == 0)      { api->print("trace empty\r\n"); return; }
     emit_frames(api, s_trace, s_tracelen);
 }
@@ -534,6 +618,10 @@ static int dispatch(const fantasi_api_t *api, const char *line)
     if (line[0] == '\0')                              return 1;
     if ((a = cmd_args(line, "search"))) { scan(api, a); return 1; }
     if ((a = cmd_args(line, "sniff")))  { do_sniff(api, a); return 1; }
+    if ((a = cmd_args(line, "read")))   { do_read(api, a); return 1; }
+    if ((a = cmd_args(line, "write")))  { do_write(api, a); return 1; }
+    if ((a = cmd_args(line, "collect"))) { do_collect(api, a); return 1; }
+    if ((a = cmd_args(line, "emulate"))) { do_emulate_cmd(api, a); return 1; }
     if ((a = cmd_args(line, "raw")))    { do_raw(api, a);   return 1; }
     if ((a = cmd_args(line, "trace")))  { do_trace(api, a); return 1; }
     if ((a = cmd_args(line, "field")))  { do_field(api, a); return 1; }
@@ -542,7 +630,7 @@ static int dispatch(const fantasi_api_t *api, const char *line)
     return 1;
 }
 
-int app_main(const fantasi_api_t *api)
+__attribute__((target("thumb"))) int app_main(const fantasi_api_t *api) /* keep PM3 RAMFS image compact */
 {
     if (!fantasi_rfid()) { api->print("rfid: no RFID on this device\r\n"); return 1; }
     if (api->abi_version < 3 || !api->read_input || !api->request_module) {
@@ -557,7 +645,7 @@ int app_main(const fantasi_api_t *api)
     api->print(PROMPT);
 
     char line[LINE_MAX];
-    int len = 0;
+    int len = 0, overflow = 0;
     for (;;) {
         char buf[32];
         int n = api->read_input(buf, sizeof buf);
@@ -570,17 +658,21 @@ int app_main(const fantasi_api_t *api)
                 while (len > 0 && line[len-1] == ' ') line[--len] = '\0';   /* trim the trailing space a
                                                        * completed command carries, so exact-match dispatch
                                                        * still recognises "sniff" / "field status" */
-                len = 0;
-                if (!dispatch(api, line)) {
+                if (overflow) {
+                    api->print("rfid: command too long\r\n");
+                } else if (!dispatch(api, line)) {
                     const fantasi_rfid_t *r = fantasi_rfid();   /* release the field a -k raw left on */
                     if (r) { r->field(0); r->set_mode(FANTASI_RFID_OFF); }
                     return 0;
                 }
+                len = 0;
+                overflow = 0;
                 api->print(PROMPT);
             } else if (c == 0x7f || c == 0x08) {          /* backspace (robustness; readline normally resolves it) */
                 if (len > 0) len--;
             } else if ((unsigned char)c >= 0x20 && (unsigned char)c < 0x7f) {
                 if (len < LINE_MAX - 1) line[len++] = c;   /* accumulate, no echo */
+                else overflow = 1;                         /* never execute a silently truncated command */
             }
             /* other control bytes ignored */
         }
