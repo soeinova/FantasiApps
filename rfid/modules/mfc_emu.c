@@ -29,6 +29,22 @@ static uint64_t emu_key(const uint8_t *card, int sector, int keytype)
 /* big-endian 4-byte store */
 static void put_be32(uint8_t *d, uint32_t v) { d[0] = v >> 24; d[1] = v >> 16; d[2] = v >> 8; d[3] = v; }
 
+#ifdef EMU_STREAM_BUF
+static int prepare_read(const uint8_t *card, int blk, uint8_t resp[18])
+{
+    if (blk < 0 || blk >= EMU_BLOCKS) return -1;
+    __builtin_memcpy(resp, card + blk * 16, 16);
+    if ((blk & 3) == 3) {
+        int c1 = (resp[7] >> 7) & 1, c2 = (resp[8] >> 3) & 1, c3 = (resp[8] >> 7) & 1;
+        int keyb_readable = (c1 == 0) && !(c2 && c3);
+        for (int i = 0; i < 6; i++) resp[i] = 0;
+        if (!keyb_readable) for (int i = 10; i < 16; i++) resp[i] = 0;
+    }
+    crc_a(resp, 16, resp + 16);
+    return 0;
+}
+#endif
+
 /* A valid weak-Crypto1-LFSR nonce: the low 16 bits are the 16-clock successor of the high 16 (exactly what
  * is_weak_prng_nonce checks). Real weak/static MIFARE Classic cards only ever return one of these, so pm3
  * finds its LFSR index; an arbitrary 32-bit value is not one and pm3 flags it (idx -1). Given the high half,
@@ -92,6 +108,169 @@ static void send_crypto(const fantasi_rfid_t *r, c1_t *cs, uint8_t *pt, int len,
 #endif
 }
 
+#ifdef EMU_STREAM_BUF
+enum { RXC_NONE, RXC_SELECT, RXC_FIRST_AUTH, RXC_AUTH, RXC_CMD };
+typedef struct {
+    c1_t base, spec, tx_spec, cmd_end;
+    uint8_t plain[64];
+    uint8_t wire[8];
+    uint8_t cmd_ks[4];
+    const fantasi_rfid_t *r;
+    const uint8_t *card;
+    const uint8_t *atqa, *uid, *sak, *select;
+    const uint8_t *nt;
+    uint8_t *resp;
+    estream_t stream;
+    uint32_t suc64, at_pt;
+    int kind, count, staged_n, atqa_len, uid_len, sak_len, nt_len;
+    int short_staged, read_prepared, select_match, match_staged, match_result;
+} rx_crypto_t;
+
+/* Speculatively clock Crypto1 while the reader frame is still on air. The HAL
+ * may restart a tentative decode at index 0; app_main commits spec only after
+ * the complete receive succeeds. */
+static void rx_crypto_byte(void *ctx, int index, uint8_t raw, int bits)
+{
+    rx_crypto_t *p = (rx_crypto_t *)ctx;
+    if (index == 0 && bits == 7) {
+        p->short_staged = 0;
+        if ((raw == 0x26 || raw == 0x52) &&
+            p->r->hf_emu_send(p->atqa, p->atqa_len) >= 0)
+            p->short_staged = 1;
+        return;
+    }
+    if (bits == 7) {
+        return;
+    }
+    if (bits != 8) return;
+    if (index == 0) p->short_staged = 0;
+    if (p->kind == RXC_NONE || index < 0 || index >= (int)sizeof p->plain) return;
+    if (index == 0) {
+        if (p->kind == RXC_AUTH) p->spec = p->base;
+        else if (p->kind == RXC_CMD) p->spec = p->cmd_end;
+        p->count = 0;
+        p->staged_n = 0;
+        p->read_prepared = 0;
+        p->select_match = 1;
+        p->match_staged = 0;
+        p->match_result = 0;
+    }
+    if (index != p->count) { p->count = -1; return; }
+    if (index < (int)sizeof p->wire) p->wire[index] = raw;
+    if (p->kind == RXC_AUTH && p->match_staged && index >= 4 && index < 8) {
+        p->plain[index] = (uint8_t)(p->suc64 >> (24 - (index - 4) * 8));
+        p->count = index + 1;
+        return;
+    }
+    if (p->kind == RXC_SELECT) {
+        p->plain[index] = raw;
+        if (index >= 9 || raw != p->select[index]) p->select_match = 0;
+        p->count = index + 1;
+        if (index == 1 && p->plain[0] == 0x93 && raw == 0x20 &&
+            p->r->hf_emu_send(p->uid, p->uid_len) >= 0)
+            p->staged_n = index + 1;
+        else if (index == 8 && p->select_match &&
+                 p->r->hf_emu_send(p->sak, p->sak_len) >= 0)
+            p->staged_n = index + 1;
+        return;
+    } else if (p->kind == RXC_FIRST_AUTH) {
+        p->plain[index] = raw;
+    } else if (p->kind == RXC_AUTH && index < 4) {
+        p->plain[index] = raw;
+        (void)c1_byte(&p->spec, raw, 1);
+    } else if (p->kind == RXC_CMD && index < 4) {
+        p->plain[index] = (uint8_t)(raw ^ p->cmd_ks[index]);
+    } else {
+        p->plain[index] = (uint8_t)(raw ^ c1_byte(&p->spec, 0, 0));
+    }
+    p->count = index + 1;
+    if (p->kind == RXC_AUTH && index == 3 && !p->match_staged &&
+        p->r->abi >= 2 && p->r->hf_emu_send_stream_match) {
+        c1_t complete = p->spec;
+        uint32_t expected = p->suc64;
+        for (int i = 4; i < 8; i++)
+            p->wire[i] = (uint8_t)(expected >> (24 - (i - 4) * 8)) ^
+                         c1_byte(&complete, 0, 0);
+        put_be32(p->resp, p->at_pt);
+        p->tx_spec = complete;
+        p->stream = (estream_t){ &p->tx_spec, p->resp, 4, 0, 0, 0, 0 };
+        if (p->r->hf_emu_send_stream_match(estream_next, &p->stream, 4 * 9 + 2,
+                                           p->wire, 8, 6, &p->match_result) >= 0) {
+            p->staged_n = 8;
+            p->match_staged = 1;
+        }
+    }
+    if (p->kind == RXC_AUTH && index == 5 && !p->match_staged &&
+        p->plain[4] == (uint8_t)(p->suc64 >> 24) &&
+        p->plain[5] == (uint8_t)(p->suc64 >> 16) &&
+        p->r->abi >= 2 && p->r->hf_emu_send_stream_match) {
+        c1_t complete = p->spec;
+        p->wire[6] = (uint8_t)(p->suc64 >> 8) ^ c1_byte(&complete, 0, 0);
+        p->wire[7] = (uint8_t)p->suc64 ^ c1_byte(&complete, 0, 0);
+        put_be32(p->resp, p->at_pt);
+        p->tx_spec = complete;
+        p->stream = (estream_t){ &p->tx_spec, p->resp, 4, 0, 0, 0, 0 };
+        if (p->r->hf_emu_send_stream_match(estream_next, &p->stream, 4 * 9 + 2,
+                                           p->wire, 8, 6, &p->match_result) >= 0) {
+            p->staged_n = 8;
+            p->match_staged = 1;
+        }
+    }
+    if (p->kind == RXC_CMD && index == 1 && p->plain[0] == 0x30) {
+        p->read_prepared = prepare_read(p->card, p->plain[1], p->resp) == 0;
+        if (p->read_prepared && p->r->abi >= 2 && p->r->hf_emu_send_stream_match) {
+            uint8_t crc[2];
+            crc_a(p->plain, 2, crc);
+            p->wire[2] = (uint8_t)(crc[0] ^ p->cmd_ks[2]);
+            p->wire[3] = (uint8_t)(crc[1] ^ p->cmd_ks[3]);
+            p->tx_spec = p->cmd_end;
+            p->stream = (estream_t){ &p->tx_spec, p->resp, 18, 0, 0, 0, 0 };
+            if (p->r->hf_emu_send_stream_match(estream_next, &p->stream, 18 * 9 + 2,
+                                               p->wire, 4, 2, &p->match_result) >= 0) {
+                p->staged_n = 4;
+                p->match_staged = 1;
+            }
+        }
+    }
+    if (p->kind == RXC_FIRST_AUTH && index == 3 &&
+        (p->plain[0] == 0x60 || p->plain[0] == 0x61) && p->plain[1] < EMU_BLOCKS) {
+        uint8_t crc[2];
+        crc_a(p->plain, 2, crc);
+        if (p->plain[2] == crc[0] && p->plain[3] == crc[1] &&
+            p->r->hf_emu_send(p->nt, p->nt_len) >= 0)
+            p->staged_n = index + 1;
+    } else if (p->kind == RXC_AUTH && index == 6 && !p->match_staged &&
+               p->plain[4] == (uint8_t)(p->suc64 >> 24) &&
+               p->plain[5] == (uint8_t)(p->suc64 >> 16) &&
+               p->plain[6] == (uint8_t)(p->suc64 >> 8) &&
+               p->r->abi >= 2 && p->r->hf_emu_send_stream_match) {
+        c1_t complete = p->spec;
+        p->wire[7] = (uint8_t)p->suc64 ^ c1_byte(&complete, 0, 0);
+        put_be32(p->resp, p->at_pt);
+        p->tx_spec = complete;
+        p->stream = (estream_t){ &p->tx_spec, p->resp, 4, 0, 0, 0, 0 };
+        if (p->r->hf_emu_send_stream_match(estream_next, &p->stream, 4 * 9 + 2,
+                                           p->wire, 8, 7, &p->match_result) >= 0) {
+            p->staged_n = 8;
+            p->match_staged = 1;
+        }
+    } else if (p->kind == RXC_AUTH && index == 7 && !p->match_staged &&
+               be32(p->plain + 4) == p->suc64) {
+        put_be32(p->resp, p->at_pt);
+        p->tx_spec = p->spec;
+        p->stream = (estream_t){ &p->tx_spec, p->resp, 4, 0, 0, 0, 0 };
+        if (p->r->hf_emu_send_stream(estream_next, &p->stream, 4 * 9 + 2) >= 0)
+            p->staged_n = index + 1;
+    } else if (p->kind == RXC_CMD && index == 3 && !p->match_staged &&
+               p->plain[0] == 0x30 && p->read_prepared) {
+        p->tx_spec = p->spec;
+        p->stream = (estream_t){ &p->tx_spec, p->resp, 18, 0, 0, 0, 0 };
+        if (p->r->hf_emu_send_stream(estream_next, &p->stream, 18 * 9 + 2) >= 0)
+            p->staged_n = index + 1;
+    }
+}
+#endif
+
 int app_main(const fantasi_api_t *api)
 {
     const fantasi_rfid_t *r = fantasi_rfid();
@@ -147,6 +326,16 @@ int app_main(const fantasi_api_t *api)
         uint8_t ntb[4]; put_be32(ntb, nonce);                /* weak card: pre-encode the static nt */
         iso14a_parity(ntb, 4, &pp); n_nt = iso14a_tag_encode(ntb, 4, &pp, ts_nt);
     }
+#ifdef EMU_STREAM_BUF
+    uint8_t select_cmd[9] = { 0x93, 0x70, uid[0], uid[1], uid[2], uid[3], bcc };
+    crc_a(select_cmd, 7, select_cmd + 7);
+    if (r->abi >= 2 && r->hf_emu_prepare) {
+        (void)r->hf_emu_prepare(ts_atqa, n_atqa);
+        (void)r->hf_emu_prepare(ts_uid, n_uid);
+        (void)r->hf_emu_prepare(ts_sak, n_sak);
+        (void)r->hf_emu_prepare(ts_nt, n_nt);
+    }
+#endif
 
     uint8_t rx[64], rxpar[16], resp[24];
     c1_t cs;
@@ -154,6 +343,7 @@ int app_main(const fantasi_api_t *api)
     uint32_t suc64 = prng_successor(nonce, 64);   /* expected reader answer ar (constant - fixed nonce) */
     uint32_t at_pt = prng_successor(nonce, 96);   /* at plaintext (constant) - keeps AUTH1 out of prng loops */
 #ifdef EMU_STREAM_BUF
+    int recv_progress = r->abi >= 2 && r->hf_emu_recv_progress;
     uint8_t ts[3 + 9 * 18];   /* pre-encode scratch for the buffer-send fallback (bit-banged frontends); holds
                                * up to the 18-byte READ. Compiled only where a non-streaming frontend needs it. */
 #else
@@ -161,7 +351,52 @@ int app_main(const fantasi_api_t *api)
 #endif
 
     for (;;) {
+#ifdef EMU_STREAM_BUF
+        rx_crypto_t rcx;
+        rcx.kind = state == E_SELECT ? RXC_SELECT :
+                   (state == E_AUTH1 ? RXC_AUTH :
+                    (state == E_WORK ? (authed ? RXC_CMD : RXC_FIRST_AUTH) : RXC_NONE));
+        rcx.count = 0;
+        rcx.staged_n = 0;
+        rcx.short_staged = 0;
+        rcx.read_prepared = 0;
+        rcx.match_staged = 0;
+        rcx.match_result = 0;
+        rcx.r = r;
+        rcx.atqa = ts_atqa;
+        rcx.atqa_len = n_atqa;
+        rcx.uid = ts_uid;
+        rcx.uid_len = n_uid;
+        rcx.sak = ts_sak;
+        rcx.sak_len = n_sak;
+        rcx.select = select_cmd;
+        rcx.nt = ts_nt;
+        rcx.nt_len = n_nt;
+        if (rcx.kind == RXC_AUTH || rcx.kind == RXC_CMD) {
+            rcx.base = cs; rcx.spec = cs;
+            rcx.suc64 = suc64; rcx.at_pt = at_pt;
+        }
+        if (rcx.kind == RXC_CMD) {
+            rcx.cmd_end = cs;
+            for (int i = 0; i < 4; i++)
+                rcx.cmd_ks[i] = c1_byte(&rcx.cmd_end, 0, 0);
+            rcx.spec = rcx.cmd_end;
+        }
+        rcx.card = card; rcx.resp = resp;
+        int n;
+        if (recv_progress) {
+            n = r->hf_emu_recv_progress(rx, rxpar, sizeof rxpar, 100, rx_crypto_byte, &rcx);
+            if (n < 0) {
+                recv_progress = 0;
+                rcx.kind = RXC_NONE;
+                n = r->hf_emu_recv(rx, rxpar, sizeof rxpar, 100);
+            }
+        } else {
+            n = r->hf_emu_recv(rx, rxpar, sizeof rxpar, 100);
+        }
+#else
         int n = r->hf_emu_recv(rx, rxpar, sizeof rx, 100);
+#endif
         if (n <= 0) {                                     /* idle: poll the host stop key only now, keeping the
                                                            * real-time recv->send path clear of the slow syscall */
             uint8_t kb;
@@ -171,18 +406,32 @@ int app_main(const fantasi_api_t *api)
 
         /* REQA / WUPA (7-bit short frame) -> ATQA (send first, then bookkeeping), fresh nonce */
         if (n == 1 && (rx[0] == 0x26 || rx[0] == 0x52)) {
+#ifdef EMU_STREAM_BUF
+            if (!(recv_progress && rcx.short_staged)) r->hf_emu_send(ts_atqa, n_atqa);
+#else
             r->hf_emu_send(ts_atqa, n_atqa);
+#endif
             state = E_SELECT; authed = 0;
             continue;
         }
 
         if (state == E_SELECT || state == E_WORK) {
             if (n >= 2 && rx[0] == 0x93 && rx[1] == 0x20) {            /* ANTICOLL CL1 -> UID + BCC */
+#ifdef EMU_STREAM_BUF
+                if (!(recv_progress && rcx.kind == RXC_SELECT && rcx.staged_n == n))
+                    r->hf_emu_send(ts_uid, n_uid);
+#else
                 r->hf_emu_send(ts_uid, n_uid);
+#endif
                 continue;
             }
             if (n >= 2 && rx[0] == 0x93 && rx[1] == 0x70) {            /* SELECT CL1 -> SAK + CRC */
+#ifdef EMU_STREAM_BUF
+                if (!(recv_progress && rcx.kind == RXC_SELECT && rcx.staged_n == n))
+                    r->hf_emu_send(ts_sak, n_sak);
+#else
                 r->hf_emu_send(ts_sak, n_sak);
+#endif
                 state = E_WORK; authed = 0;
                 continue;
             }
@@ -198,8 +447,21 @@ int app_main(const fantasi_api_t *api)
              * byte(s) with 0 and decrypt the full 4: only the 32-bit count must match the reader, not the values.
              * No-op on hardware-framed frontends (PM3/Chameleon) that already return the full 4. */
             if (authed && n >= 1 && n < 4) { for (int i = n; i < 4; i++) rx[i] = 0; n = 4; }
-            for (int i = 0; i < n; i++) cmd[i] = rx[i];
-            if (authed) mf_crypto1_decrypt(&cs, cmd, n);              /* post-auth frames are encrypted */
+            int cmd_ready = 0;
+#ifdef EMU_STREAM_BUF
+            if (authed && recv_progress && rcx.kind == RXC_CMD && rcx.count >= 0) {
+                for (int i = rcx.count; i < n; i++) rx_crypto_byte(&rcx, i, rx[i], 8);
+                if (rcx.count == n) {
+                    cs = rcx.spec;
+                    for (int i = 0; i < n; i++) cmd[i] = rcx.plain[i];
+                    cmd_ready = 1;
+                }
+            }
+#endif
+            if (!cmd_ready) {
+                for (int i = 0; i < n; i++) cmd[i] = rx[i];
+                if (authed) mf_crypto1_decrypt(&cs, cmd, n);          /* post-auth frames are encrypted */
+            }
 
             if (n >= 2 && (cmd[0] == 0x60 || cmd[0] == 0x61)) {        /* AUTH key A/B for a block */
                 int nested = authed;                                  /* 60/61 while already authenticated = nested */
@@ -209,7 +471,13 @@ int app_main(const fantasi_api_t *api)
                 put_be32(ntb, nonce); put_be32(ksb, cuid ^ nonce);
                 c1_init(&cs, emu_key(card, authsc, authkey));
                 if (!nested) {
+#ifdef EMU_STREAM_BUF
+                    int reply_staged = recv_progress && rcx.kind == RXC_FIRST_AUTH && rcx.staged_n == n;
+                    if (!reply_staged)
+                        r->hf_emu_send(ts_nt, n_nt);                 /* first auth: static nt pre-encoded */
+#else
                     r->hf_emu_send(ts_nt, n_nt);                     /* first auth: static nt pre-encoded (82us FDT) */
+#endif
                     c1_word(&cs, cuid ^ nonce, 0);                    /* advance cipher (feeds cuid^nonce) */
                 } else {
                     /* Nested auth: nt is encrypted. Stream it feeding cuid^nonce, which both encrypts nt and
@@ -221,8 +489,21 @@ int app_main(const fantasi_api_t *api)
                 continue;
             }
 
+#ifdef EMU_STREAM_BUF
+            if (n == 4 && cmd[0] == 0x30 && authed) {                  /* READ block */
+#else
             if (n >= 2 && cmd[0] == 0x30 && authed) {                  /* READ block */
+#endif
                 int blk = cmd[1];
+#ifdef EMU_STREAM_BUF
+                int reply_staged = recv_progress && rcx.staged_n == n &&
+                                   (!rcx.match_staged || rcx.match_result);
+                if (reply_staged) cs = rcx.tx_spec;
+                if (!reply_staged) {
+                    if (prepare_read(card, blk, resp) != 0) continue;
+                    send_crypto(r, &cs, resp, 18, 0, ts);            /* encrypted READ reply (16 data + 2 CRC) */
+                }
+#else
                 if (blk < 0 || blk >= EMU_BLOCKS) continue;
                 for (int i = 0; i < 16; i++) resp[i] = card[blk * 16 + i];
                 /* Access control: apply the sector-trailer read rules a real card enforces. KeyA is never
@@ -237,23 +518,65 @@ int app_main(const fantasi_api_t *api)
                 }
                 crc_a(resp, 16, resp + 16);
                 send_crypto(r, &cs, resp, 18, 0, ts);                /* encrypted READ reply (16 data + 2 CRC) */
+#endif
                 continue;
             }
 
             if (n >= 2 && cmd[0] == 0x50) { state = E_IDLE; authed = 0; continue; }  /* HALT */
         }
 
-        /* nr||ar is always 8 bytes. If a frontend's edge decoder loses a trailing sequence-Y (0x00, no-pause)
-         * byte it returns n=7; pad the missing byte(s) with 0 (they're 0 by definition) so the crypto sees the
-         * full nr||ar. No-op on hardware-framed frontends (PM3/Chameleon) that already return all 8. */
+        /* nr||ar is always 8 bytes. A transparent edge decoder can report seven bytes when the final
+         * ciphertext byte has no observable trailing pause. CM4 recovers it from Crypto1 only when the
+         * received AR prefix authenticates; other builds retain zero-fill handling for all-Y suffixes. */
         if (state == E_AUTH1 && n >= 4 && n <= 8) {                   /* reader answer nr || ar */
+#ifdef EMU_STREAM_BUF
+            if (n < 8 && recv_progress && rcx.kind == RXC_AUTH &&
+                rcx.match_staged && rcx.match_result) {
+                for (int i = n; i < 8; i++) rx[i] = rcx.wire[i];
+                n = 8;
+            }
+            if (n == 7) {
+                c1_t probe = cs;
+                c1_word(&probe, be32(rx), 1);
+                uint8_t expect[4];
+                put_be32(expect, suc64 ^ c1_word(&probe, 0, 0));
+                if (rx[4] == expect[0] && rx[5] == expect[1] && rx[6] == expect[2]) {
+                    rx[7] = expect[3];
+                    n = 8;
+                }
+            }
+#endif
             for (int i = n; i < 8; i++) rx[i] = 0;                    /* trailing all-Y bytes the decoder lost */
-            uint32_t nr = be32(rx), ar = be32(rx + 4);
-            c1_word(&cs, nr, 1);
-            uint32_t cardRr = ar ^ c1_word(&cs, 0, 0);
+            n = 8;                                                    /* subsequent Crypto1/reply state is full-width */
+            uint32_t cardRr;
+            int auth_ready = 0;
+#ifdef EMU_STREAM_BUF
+            if (recv_progress && rcx.kind == RXC_AUTH && rcx.match_staged) {
+                cardRr = rcx.match_result ? suc64 : ~suc64;
+                auth_ready = 1;
+            } else if (recv_progress && rcx.kind == RXC_AUTH && rcx.count >= 0) {
+                for (int i = rcx.count; i < 8; i++) rx_crypto_byte(&rcx, i, rx[i], 8);
+                if (rcx.count == 8) {
+                    cs = rcx.spec;
+                    cardRr = be32(rcx.plain + 4);
+                    auth_ready = 1;
+                }
+            }
+#endif
+            if (!auth_ready) {
+                uint32_t nr = be32(rx), ar = be32(rx + 4);
+                c1_word(&cs, nr, 1);
+                cardRr = ar ^ c1_word(&cs, 0, 0);
+            }
             if (cardRr != suc64) { state = E_WORK; authed = 0; continue; }   /* auth KO: real tags stay silent */
             put_be32(resp, at_pt);                                    /* at (precomputed plaintext) */
-            send_crypto(r, &cs, resp, 4, 0, ts);                     /* third-pass at */
+            int reply_staged = 0;
+#ifdef EMU_STREAM_BUF
+            reply_staged = recv_progress && rcx.staged_n == n &&
+                           (!rcx.match_staged || rcx.match_result);
+            if (reply_staged) cs = rcx.tx_spec;
+#endif
+            if (!reply_staged) send_crypto(r, &cs, resp, 4, 0, ts); /* third-pass at */
             state = E_WORK; authed = 1;
             continue;
         }
